@@ -110,7 +110,8 @@ import mani_skill  # noqa: E402
 
 CSV_COLS = ["iter", "global_step", "l_rl", "l_kl", "lam", "kl_value", "pg_loss",
             "v_loss", "entropy", "clipfrac", "approx_kl", "grad_norm",
-            "teacher_coverage", "train_reward", "eval_success", "sps"]
+            "teacher_coverage", "teacher_hitrate", "teacher_dist", "teacher_j",
+            "train_reward", "eval_success", "sps"]
 
 # --------------------------------------------------------------------------- #
 # config
@@ -184,6 +185,32 @@ class Args:
     """number of arm joints; remaining action dims are gripper."""        # [OURS A2]
     align_track_rot: bool = False      # stand-in teacher carries no orientation
     kl_normalize_by_masked: bool = True
+
+    # -- [OURS A8..A11] time-alignment / gate / gripper (teacher.py) --------- #
+    align: str = "window"
+    """`index` | `nn` | `mono` | `window`. The paper specifies NONE of this; only
+    Fig. 3 exists, so this is our engineering choice. `window` = monotone + rate
+    limited nearest neighbour over [j, j+window]."""
+    align_window: int = 8
+    """forward window in waypoints for `--align window`."""
+    lookahead_dist: float = 0.05
+    """pure-pursuit target distance [m] ALONG the path. Without it a densely sampled
+    RRT* trajectory (waypoints ~1 cm apart) makes `--align-lookahead 1` ask for ~0.1
+    of an action, i.e. the teacher is technically active but says nothing useful.
+    0.0 restores the old integer-index behaviour."""
+    gate: str = "soft"
+    """`soft` = w=exp(-d^2/2 sigma^2) (never 0 => Eq. 7's KL always has a gradient)
+    | `hard` = 1[d<eps] (the old behaviour; silently no-ops if the student never
+    enters the tube)."""
+    gate_sigma: float = 0.05
+    """[m] soft-gate length scale."""
+    gripper_src: str = "j"
+    """`j` (matched phase) | `tgt` (pure-pursuit phase) | `none` (let RL learn the
+    grasp timing; remember to zero its dim_weight)."""
+    align_dist_dims: int = 3
+    """number of leading dims used for the alignment metric (3 = xyz)."""
+    reanchor_on_reset: bool = True
+    """snap j to the nearest waypoint on reset instead of 0."""       # [OURS A8b]
 
     # -- io --
     save_model: bool = False
@@ -477,16 +504,28 @@ def main(args: Args):
     pos_scale, rot_scale = read_align_scales(envs)
     print(f"[info] controller scales: pos_scale={pos_scale} rot_scale={rot_scale}")
 
+    _dw = (1.0,) * act_dim if teacher_mode == "joint" else (
+        (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0) if args.align_track_rot
+        else (1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0))
+    if args.gripper_src == "none" and len(_dw) > 1:
+        # let RL own the grasp timing: the teacher must not constrain that dim at all
+        _dw = tuple(_dw[:-1]) + (0.0,)
     align_cfg = AlignConfig(
         mode=teacher_mode,
         eps=args.align_eps, lookahead=args.align_lookahead, monotone=args.align_monotone,
+        align=args.align, window=args.align_window,
+        lookahead_dist=args.lookahead_dist, gate=args.gate, gate_sigma=args.gate_sigma,
+        gripper_src=args.gripper_src, dist_dims=args.align_dist_dims,
+        reanchor_on_reset=args.reanchor_on_reset,
         pos_scale=pos_scale, rot_scale=rot_scale,
         joint_scale=args.joint_scale, arm_dim=args.arm_dim, sigma_t=args.sigma_t,
         track_rot=args.align_track_rot,
-        dim_weight=(1.0,) * act_dim if teacher_mode == "joint" else (
-            (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0) if args.align_track_rot
-            else (1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0)),
+        dim_weight=_dw,
     )
+    print(f"[info] alignment: align={align_cfg.align} window={align_cfg.window} "
+          f"lookahead={align_cfg.lookahead} lookahead_dist={align_cfg.lookahead_dist} "
+          f"gate={align_cfg.gate} gate_sigma={align_cfg.gate_sigma} "
+          f"gripper_src={align_cfg.gripper_src} dim_weight={align_cfg.dim_weight}")
     teacher = None
     if args.kl_enable and args.teacher != "none":
         teacher = TrajectoryTeacher(align_cfg, n_envs=args.num_envs, act_dim=act_dim, device=device)
@@ -522,7 +561,10 @@ def main(args: Args):
     done_buf = torch.zeros((T, N), device=device)
     val_buf = torch.zeros((T, N), device=device)
     teach_buf = torch.zeros((T, N, act_dim), device=device)
-    tmask_buf = torch.zeros((T, N), dtype=torch.bool, device=device)
+    # float, because with --gate soft this is a per-sample WEIGHT in (0,1], not a bool
+    tmask_buf = torch.zeros((T, N), device=device)
+    tdist_buf = torch.zeros((T, N), device=device)
+    tj_buf = torch.zeros((T, N), device=device)
 
     n_updates = max(1, args.total_timesteps // (T * N))
     batch_size = min(args.batch_size, T * N)
@@ -555,9 +597,11 @@ def main(args: Args):
 
             if teacher is not None:
                 with torch.no_grad():
-                    ta, tm, _ = teacher.action(teacher_state())
+                    ta, tm, td = teacher.action(teacher_state())
                 teach_buf[step] = ta
                 tmask_buf[step] = tm
+                tdist_buf[step] = td
+                tj_buf[step] = teacher.j[:N].to(tdist_buf.dtype)
 
             with torch.no_grad():
                 action, logp, _, value = agent.get_action_and_value(next_obs)
@@ -581,16 +625,20 @@ def main(args: Args):
                     and (step + 1) % args.standin_reanchor_every == 0
                 )
                 if reanchor:
+                    # go through set_trajectory (NOT teacher.tau = ...) so the cached
+                    # arc length used by the pure-pursuit lookahead is rebuilt too.
                     if args.teacher == "joint":
-                        teacher.tau = build_standin_joint_traj(
-                            envs, N, args.arm_dim, act_dim).to(teacher.device)
-                        teacher.gripper = None
+                        teacher.set_trajectory(
+                            build_standin_joint_traj(envs, N, args.arm_dim, act_dim))
                     else:
                         _t, _g = build_standin_traj(envs, N)
-                        teacher.tau = _t.to(teacher.device)
-                        teacher.gripper = None if _g is None else _g.to(teacher.device)
-                if bool(done.any()):
-                    teacher.reset(mask=done)
+                        teacher.set_trajectory(_t, _g)
+
+            # [FIX] reset the progress pointer for ANY teacher -- the old code only
+            # did this inside the standin branch, so `--teacher traj` never rewound j
+            # when an environment reset and the teacher pointed at the path's end.
+            if teacher is not None and bool(done.any()):
+                teacher.reset(mask=done, state=teacher_state())
 
         rollout_time = time.time() - rollout_t0
 
@@ -623,7 +671,7 @@ def main(args: Args):
                     # positive; -E[adv*logpi] is signed and is mildly negative early
                     # in training, hence the abs() [OURS A6].
                     l_rl = abs(float(-(b_adv * newlogp).mean()))
-                    if bool(b_tmask.any()):
+                    if float(b_tmask.sum()) > 1e-12:
                         w = align_cfg.weight_tensor(act_dim, device, m.dtype)
                         l_kl = float(gaussian_kl(m, s, b_teach, b_tmask, args.sigma_t, w,
                                                  args.kl_normalize_by_masked))
@@ -660,7 +708,7 @@ def main(args: Args):
 
                 loss = pg_loss - args.ent_coef * entropy_loss + args.vf_coef * v_loss
 
-                if args.kl_enable and bool(b_tmask[mb].any()):
+                if args.kl_enable and float(b_tmask[mb].sum()) > 1e-12:
                     m, s = agent.distribution(b_obs[mb])
                     w = align_cfg.weight_tensor(act_dim, device, m.dtype)
                     kl_value = gaussian_kl(m, s, b_teach[mb], b_tmask[mb], args.sigma_t, w,
@@ -682,14 +730,24 @@ def main(args: Args):
             eval_success = evaluate(agent, eval_envs, args.num_eval_steps, device, args.eval_seed)
 
         sps = int(global_step / (time.time() - start_time))
-        cov = float(tmask_buf.float().mean()) if args.kl_enable else float("nan")
-        bcov = float(b_tmask.float().mean()) if args.kl_enable else float("nan")
+        if args.kl_enable:
+            # teacher_coverage = mean KL weight (with --gate soft this decays smoothly
+            # toward 0 as the student leaves the tube instead of hitting a hard 0).
+            cov = float(tmask_buf.mean())
+            # teacher_hitrate = fraction of samples actually INSIDE the eps tube.
+            #   *** if this stays ~0 the whole RRT*-RL stage is a no-op ***
+            hit = float((tdist_buf < args.align_eps).float().mean())
+            tdist = float(tdist_buf.mean())
+            tj = float(tj_buf.mean())
+        else:
+            cov = hit = tdist = tj = float("nan")
         train_rew = float(np.mean(ep_rew)) if ep_rew else float("nan")
 
         row = dict(iter=iteration, global_step=global_step, l_rl=l_rl, l_kl=l_kl, lam=lam,
                    kl_value=float(kl_value), pg_loss=float(pg_loss), v_loss=float(v_loss),
                    entropy=float(entropy_loss), clipfrac=float(clipfrac), approx_kl=float(approx_kl),
-                   grad_norm=float(gn), teacher_coverage=cov, train_reward=train_rew,
+                   grad_norm=float(gn), teacher_coverage=cov, teacher_hitrate=hit,
+                   teacher_dist=tdist, teacher_j=tj, train_reward=train_rew,
                    eval_success=eval_success, sps=sps)
         csv_w.writerow([row[k] for k in CSV_COLS])
         csv_f.flush()
@@ -700,7 +758,7 @@ def main(args: Args):
             print(f"it {iteration:4d}/{n_updates}  step {global_step:8d}  "
                   f"rew {rew_s}  pg {row['pg_loss']:+.4f}  v {row['v_loss']:.4f}  "
                   f"kl {row['kl_value']:.5f}  lam {lam:.4g}  "
-                  f"cover {cov:.3f}/{bcov:.3f}  evalS {ev_s}"
+                  f"w {cov:.4f} hit {hit:.3f} d {tdist:.4f} j {tj:5.1f}  evalS {ev_s}"
                   f"  | rollout {rollout_time:.2f}s upd {update_time:.2f}s  {sps} SPS")
 
     # ---- done ---------------- #

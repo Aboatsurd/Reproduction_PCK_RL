@@ -76,7 +76,89 @@ class AlignConfig:
     teacher would say nothing)."""
 
     monotone: bool = True
-    """[OURS A2] enforce j_t >= j_{t-1} inside an episode (anti phase-collapse)."""
+    """[OURS A2] (legacy alias) enforce j_t >= j_{t-1} inside an episode.
+
+    Kept only as the fallback for ``align=""``; ``align`` supersedes it."""
+
+    # ---- [OURS A8..A11] time alignment ----------------------------------- #
+    align: str = ""
+    """[OURS A8] how student step t is matched to a trajectory index j.
+
+    ``""``      -- legacy: ``"mono"`` if ``monotone`` else ``"nn"``.
+    ``"index"`` -- j = step counter. The author's ``follow_path`` semantics
+                   (open loop, one waypoint per env step). Breaks as soon as the
+                   student's tempo differs from the planner's.
+    ``"nn"``    -- j = argmin_i ||s_t - tau_i||. Phase can collapse backwards and
+                   a self-intersecting path is ambiguous.
+    ``"mono"``  -- max(nn, j_{t-1}). Kills the backwards collapse, but still lets
+                   j jump arbitrarily far forward, and locks onto the wrong branch
+                   irreversibly where the path crosses itself.
+    ``"window"``-- **default / recommended**. argmin over the bounded window
+                   ``[j_{t-1}, j_{t-1} + window]``. Monotone (no collapse), rate
+                   limited (no runaway jump), density independent (argmin picks the
+                   genuinely closest waypoint, so it works for 1 mm and 10 cm
+                   spacing alike), and never globally ambiguous (it cannot see the
+                   crossing branch).
+
+    Why not DTW: DTW is *non-causal* -- it needs the whole student trajectory, so it
+    cannot emit an action online. Use it offline as a diagnostic only.
+    """
+
+    window: int = 8
+    """[OURS A8] forward window (in waypoints) for ``align="window"``. Too small =>
+    j lags when the student sprints; too large => a wide lateral excursion can pick a
+    wrong-but-nearby forward waypoint. 8 waypoints ~ a few cm of path."""
+
+    lookahead_dist: float = 0.05
+    """[OURS A9] pure-pursuit target distance [m] ALONG THE PATH.
+
+    This is the fix for a silent failure: with ``lookahead=1`` the teacher aims one
+    *index* ahead, so on a densely sampled RRT* trajectory (spacing ~1 cm) it asks
+    for ~0.1 of an action -- i.e. the teacher is present but says nothing useful.
+    Aiming a fixed ARC LENGTH ahead makes the guidance independent of how finely the
+    planner sampled the path. Set to 0 to fall back to the integer ``lookahead``
+    (the old behaviour); it then only differs when the spacing exceeds this value.
+    """
+
+    gate: str = "soft"
+    """[OURS A10] how the per-sample KL weight is built from the tracking distance.
+
+    ``"hard"`` -- w = 1[dist < eps]. If the student starts (or drifts) outside the
+                  tube, EVERY weight is 0, the KL term is identically 0, and the
+                  whole RRT*-RL stage silently does nothing while the losses still
+                  go down because plain PPO is still working. Hard to notice.
+    ``"soft"`` -- **default**. w = exp(-dist^2 / (2 gate_sigma^2)), never exactly 0,
+                  so Eq. (7)'s KL term has a gradient from step 0. Far-away samples
+                  decay to ~0 by themselves, so this does not pollute the signal.
+    """
+
+    gate_sigma: float = 0.05
+    """[OURS A10] length scale [m] of the soft gate. ~the tube radius you would have
+    used for ``eps``; sweep together with ``eps`` (TodoList 3.10)."""
+
+    gripper_src: str = "j"
+    """[OURS A11] which phase drives the gripper dimension.
+
+    ``"j"``   -- the matched phase (default).
+    ``"tgt"`` -- the pure-pursuit target phase (a bit early).
+    ``"none"``-- never emit a gripper action (zero that dim AND zero its
+                 ``dim_weight``); use when the grasp timing is being learned by RL.
+
+    Rationale: a grasp is triggered by a *contact event*, not by a coordinate. Since
+    ``j`` is now a bounded monotone phase estimate it is a far better clock than the
+    raw nearest neighbour was, but this knob exists because mis-timed gripper
+    commands are a known, concrete failure mode of NN-aligned teachers.
+    """
+
+    dist_dims: int = 3
+    """[OURS] how many leading dims form the alignment metric (3 = xyz / first three
+    joints). Rotation is deliberately excluded: near the goal the orientation swings
+    fast and would dominate an otherwise positional match."""
+
+    reanchor_on_reset: bool = True
+    """[OURS A8b] on ``reset(state=...)`` snap j to the nearest waypoint instead of
+    blindly 0. Safe because a fresh trajectory starts where the robot is; it matters
+    when a trajectory is reused across episodes."""
 
     pos_scale: float = 0.1
     """[m] the controller's pos_upper (panda.py:116). Read from the env at runtime
@@ -107,6 +189,23 @@ class AlignConfig:
 
     clip_action: bool = True
     """Clip the emitted action exactly the way the controller does."""
+
+    def __post_init__(self):
+        if not self.align:  # legacy: keep the old --align-monotone flag meaningful
+            self.align = "mono" if self.monotone else "nn"
+        self.align = str(self.align).lower()
+        if self.align not in ("index", "nn", "mono", "window"):
+            raise ValueError(f"align must be one of index|nn|mono|window, got {self.align!r}")
+        self.gate = str(self.gate).lower()
+        if self.gate not in ("hard", "soft"):
+            raise ValueError(f"gate must be hard|soft, got {self.gate!r}")
+        self.gripper_src = str(self.gripper_src).lower()
+        if self.gripper_src not in ("j", "tgt", "none"):
+            raise ValueError(f"gripper_src must be j|tgt|none, got {self.gripper_src!r}")
+        if self.window < 0:
+            raise ValueError("window must be >= 0")
+        if self.gate_sigma <= 0:
+            raise ValueError("gate_sigma must be > 0")
 
     def weight_tensor(self, n_act: int, device, dtype) -> torch.Tensor:
         w = torch.as_tensor(self.dim_weight, device=device, dtype=dtype)
@@ -182,8 +281,10 @@ class TrajectoryTeacher:
 
         self.tau: Optional[torch.Tensor] = None      # (K, T, 7)
         self.gripper: Optional[torch.Tensor] = None  # (K, T)
+        self.arclen: Optional[torch.Tensor] = None   # (K, T) cumulative path length
         self.traj_id = torch.zeros(n_envs, dtype=torch.long, device=device)
         self.j = torch.zeros(n_envs, dtype=torch.long, device=device)
+        self.step_count = torch.zeros(n_envs, dtype=torch.long, device=device)
 
     # -- trajectory management -------------------------------------------------
     def set_trajectory(self, tau, gripper=None, traj_id=None):
@@ -213,14 +314,50 @@ class TrajectoryTeacher:
         elif tau.shape[0] == self.n_envs:
             self.traj_id = torch.arange(self.n_envs, device=self.device)
 
+        self._rebuild_arclen()
         self.j = torch.zeros(self.n_envs, dtype=torch.long, device=self.device)
+        self.step_count = torch.zeros(self.n_envs, dtype=torch.long, device=self.device)
 
-    def reset(self, mask: Optional[torch.Tensor] = None):
-        """Zero the progress pointer.  ``mask`` (bool (N,)) selects which envs reset."""
+    def _rebuild_arclen(self):
+        """Cumulative arc length (K,T) of the alignment metric, used by the
+        pure-pursuit lookahead so the target distance is in metres, not indices."""
+        if self.tau is None:
+            self.arclen = None
+            return
+        dd = min(int(self.cfg.dist_dims), self.tau.shape[-1])
+        seg = torch.linalg.norm(self.tau[:, 1:, :dd] - self.tau[:, :-1, :dd], dim=-1)  # (K,T-1)
+        zero = torch.zeros(seg.shape[0], 1, device=self.device, dtype=self.dtype)
+        self.arclen = torch.cat([zero, torch.cumsum(seg, dim=1)], dim=1).contiguous()  # (K,T)
+
+    def nearest_index(self, state) -> torch.Tensor:
+        """(N,dist_dims) -> (N,) nearest waypoint index. Used to re-anchor on reset."""
+        assert self.tau is not None, "call set_trajectory() first"
+        state = torch.as_tensor(state, device=self.device, dtype=self.dtype)
+        n = state.shape[0]
+        tau = self.tau[self.traj_id[:n]]
+        dd = min(int(self.cfg.dist_dims), tau.shape[-1])
+        d = torch.linalg.norm(tau[:, :, :dd] - state[:, None, :dd], dim=2)
+        return torch.argmin(d, dim=1)
+
+    def reset(self, mask: Optional[torch.Tensor] = None, state=None):
+        """Reset the progress pointer.  ``mask`` (bool (N,)) selects which envs reset.
+
+        ``state`` (optional) is the *current* tracking state; with
+        ``cfg.reanchor_on_reset`` it snaps j to the nearest waypoint instead of 0,
+        which matters when a trajectory does not literally start at the robot pose.
+        """
+        n = self.n_envs
+        j0 = torch.zeros(n, dtype=torch.long, device=self.device)
+        if state is not None and self.cfg.reanchor_on_reset and self.tau is not None:
+            j0 = self.nearest_index(state)[:n].to(self.device).long()
         if mask is None:
-            self.j.zero_()
+            self.j = j0.clone()
+            self.step_count = torch.zeros(n, dtype=torch.long, device=self.device)
         else:
-            self.j = torch.where(mask.to(self.device), torch.zeros_like(self.j), self.j)
+            m = mask.to(self.device)
+            self.j = torch.where(m, j0, self.j)
+            self.step_count = torch.where(
+                m, torch.zeros_like(self.step_count), self.step_count)
 
     # -- query -----------------------------------------------------------------
     @torch.no_grad()
@@ -229,51 +366,88 @@ class TrajectoryTeacher:
         joint positions when mode='joint'.
 
         Returns ``(action (N,A), mask (N,), dist (N,))``.  ``action`` is a raw env
-        action; ``mask`` is True where the teacher is active (KL is applied).
+        action; ``mask`` is the **per-sample KL weight** -- ``1[dist<eps]`` for
+        ``gate="hard"`` (backwards compatible bool) and ``exp(-d^2/2 sigma^2)`` in
+        ``(0,1]`` for ``gate="soft"``.  ``dist`` is the tracking distance [m] at the
+        matched phase, so a caller can always recover the hard hit-rate itself.
         """
         assert self.tau is not None, "call set_trajectory() first"
         dev = self.device
+        cfg = self.cfg
         state = torch.as_tensor(state, device=dev, dtype=self.dtype)
         n = state.shape[0]
         tau = self.tau[self.traj_id[:n]]           # (N, T, D)
         T = tau.shape[1]
+        idx_n = torch.arange(n, device=dev)
 
-        # nearest waypoint in the first 3 dims (xyz / first 3 joints)
-        d = torch.linalg.norm(tau[:, :, :3] - state[:, None, :3], dim=2)  # (N,T)
+        # nearest waypoint in the first ``dist_dims`` dims (xyz / first 3 joints)
+        dd = min(int(cfg.dist_dims), tau.shape[-1])
+        d = torch.linalg.norm(tau[:, :, :dd] - state[:, None, :dd], dim=2)  # (N,T)
         j_nn = torch.argmin(d, dim=1)
 
-        j = torch.maximum(j_nn, self.j[:n]) if self.cfg.monotone else j_nn
+        # ---- [OURS A8] time alignment ------------------------------------- #
+        if cfg.align == "index":
+            j = torch.clamp(self.step_count[:n], 0, T - 1)
+        elif cfg.align == "nn":
+            j = j_nn
+        elif cfg.align == "mono":
+            j = torch.maximum(j_nn, self.j[:n])
+        else:  # "window": monotone AND rate limited
+            lo = self.j[:n].clamp(max=T - 1)
+            hi = (lo + max(int(cfg.window), 0)).clamp(max=T - 1)
+            ar = torch.arange(T, device=dev).unsqueeze(0)
+            in_win = (ar >= lo.unsqueeze(1)) & (ar <= hi.unsqueeze(1))
+            d_win = torch.where(in_win, d, torch.full_like(d, float("inf")))
+            j = d_win.argmin(dim=1)
         j = torch.clamp(j, 0, T - 1)
         self.j[:n] = j
 
-        dist = d[torch.arange(n, device=dev), j]
+        dist = d[idx_n, j]
 
-        # aim lookahead waypoints ahead (lookahead=0 would be a zero target)
-        j_tgt = torch.clamp(j + self.cfg.lookahead, 0, T - 1)
-        tgt = tau[torch.arange(n, device=dev), j_tgt]
+        # ---- [OURS A9] pure-pursuit target -------------------------------- #
+        # integer lookahead (legacy) ...
+        j_tgt = torch.clamp(j + max(int(cfg.lookahead), 0), 0, T - 1)
+        # ... then push it out to a fixed ARC LENGTH so a densely sampled RRT*
+        # trajectory still yields a meaningful (non-vanishing) target.
+        if cfg.lookahead_dist > 0 and self.arclen is not None:
+            al = self.arclen[self.traj_id[:n]].contiguous()
+            s_t = al[idx_n, j] + float(cfg.lookahead_dist)
+            j_pp = torch.searchsorted(al, s_t.unsqueeze(1)).squeeze(1)
+            j_tgt = torch.maximum(j_tgt, torch.clamp(j_pp, 0, T - 1))
+        j_tgt = torch.clamp(j_tgt, 0, T - 1)
+        tgt = tau[idx_n, j_tgt]
 
         action = torch.zeros(n, self.act_dim, device=dev, dtype=self.dtype)
 
-        if self.cfg.mode == "ee_pose":
+        if cfg.mode == "ee_pose":
             action[:, :6] = pose_delta_action(
-                state, tgt, self.cfg.pos_scale, self.cfg.rot_scale, self.cfg.track_rot
+                state, tgt, cfg.pos_scale, cfg.rot_scale, cfg.track_rot
             )
-            if self.gripper is not None:
-                g = self.gripper[self.traj_id[:n]]
-                action[:, -1] = g[torch.arange(n, device=dev), j]
-            if self.cfg.clip_action:
+            if self.gripper is not None and cfg.gripper_src != "none":
+                gj = j_tgt if cfg.gripper_src == "tgt" else j
+                action[:, -1] = self.gripper[self.traj_id[:n]][idx_n, gj]
+            if cfg.clip_action:
                 action = _clip_like_controller(action)
         else:
-            arm = min(self.cfg.arm_dim, self.act_dim)
+            arm = min(cfg.arm_dim, self.act_dim)
             action[:, :arm] = torch.clip(
-                (tgt[:, :arm] - state[:, :arm]) / max(self.cfg.joint_scale, 1e-8), -1, 1
+                (tgt[:, :arm] - state[:, :arm]) / max(cfg.joint_scale, 1e-8), -1, 1
             )
-            if tgt.shape[-1] > arm:
-                action[:, arm:] = tgt[:, arm:]
-            if self.cfg.clip_action:
+            if tgt.shape[-1] > arm and cfg.gripper_src != "none":
+                if cfg.gripper_src == "tgt":
+                    action[:, arm:] = tgt[:, arm:]
+                else:  # "j"
+                    action[:, arm:] = tau[idx_n, j][:, arm:]
+            if cfg.clip_action:
                 action = torch.clip(action, -1, 1)
 
-        mask = dist < self.cfg.eps
+        # ---- [OURS A10] gate ---------------------------------------------- #
+        if cfg.gate == "soft":
+            mask = torch.exp(-0.5 * (dist / float(cfg.gate_sigma)) ** 2)
+        else:
+            mask = (dist < cfg.eps).to(self.dtype)
+
+        self.step_count[:n] += 1
         return action, mask, dist
 
 
@@ -352,3 +526,111 @@ if __name__ == "__main__":  # tiny self-test: math sanity, no simulator needed
     assert ja[0, 0] > 0.9, ja[0, 0]             # (0.1 - 0.0)/0.1 = 1.0
     assert abs(float(ja[0, -1]) - 1.0) < 1e-6, ja[0, -1]
     print("joint mode OK")
+
+    # =================================================================== #
+    # [OURS A8..A11] alignment regression tests
+    # =================================================================== #
+    import torch as _t
+
+    def _mk(dense):
+        """straight +x path, `dense` mm spacing, T=60."""
+        step = dense / 1000.0
+        pts = _t.zeros(60, 7)
+        pts[:, 0] = _t.arange(60) * step
+        pts[:, 3] = 1.0
+        return pts
+
+    # ---- (1) pure pursuit: a DENSE trajectory must still give a real target ----
+    dense = _mk(6)                                    # 6 mm spacing
+    cfg = AlignConfig(align="window", lookahead=1, lookahead_dist=0.05,
+                      gate="hard", eps=1e-6)          # eps~0 => only exact hit
+    tt = TrajectoryTeacher(cfg, n_envs=1, act_dim=7)
+    tt.set_trajectory(dense, gripper=_t.zeros(60))
+    tt.reset(state=_t.tensor([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]]))
+    a_dense, _, _ = tt.action(_t.tensor([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]]))
+    # OLD behaviour (lookahead=1 on 6 mm spacing) would ask for 0.06.
+    # Pure pursuit must ask for ~0.05 m / 0.1 = 0.5.
+    assert a_dense[0, 0] > 0.4, f"pure-pursuit target too weak: {float(a_dense[0,0])}"
+    print(f"pure-pursuit on 6mm spacing: a_x={float(a_dense[0,0]):.3f} (lookahead=1 alone would be 0.06)")
+
+    # and the legacy path is untouched when lookahead_dist=0
+    c0 = AlignConfig(align="window", lookahead=1, lookahead_dist=0.0,
+                     gate="hard", eps=1e-6)
+    t0 = TrajectoryTeacher(c0, n_envs=1, act_dim=7)
+    t0.set_trajectory(dense, gripper=_t.zeros(60))
+    t0.reset(state=_t.tensor([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]]))
+    a0, _, _ = t0.action(_t.tensor([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]]))
+    assert abs(float(a0[0, 0]) - 0.06) < 1e-4, float(a0[0, 0])
+    print(f"lookahead_dist=0 fallback preserved: a_x={float(a0[0,0]):.3f}")
+
+    # ---- (2) window mode: monotone AND rate limited ----
+    cfgw = AlignConfig(align="window", window=3, lookahead=1, lookahead_dist=0.0,
+                       gate="hard", eps=1e9)
+    tw = TrajectoryTeacher(cfgw, n_envs=1, act_dim=7)
+    tw.set_trajectory(dense, gripper=_t.zeros(60))
+    tw.reset(state=_t.tensor([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]]))
+    js = []
+    for k in range(10):
+        # teleport the "student" to waypoint 40k mm ahead -- an illegal jump
+        st = _t.tensor([[0.040 * k, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]])
+        tw.action(st)
+        js.append(int(tw.j[0]))
+    assert js[0] <= 3, js          # first call cannot reach index 40/6=6.67
+    jumps = np.diff(js)
+    assert (jumps >= 0).all(), js  # monotone
+    assert (jumps <= cfgw.window).all(), js   # rate limited
+    print(f"window monotone+rate-limited: j={js} (window={cfgw.window})")
+
+    # ---- (3) soft gate is never identically zero (the cold-start fix) ----
+    cfgs = AlignConfig(align="window", gate="soft", gate_sigma=0.05, eps=0.001)
+    ts = TrajectoryTeacher(cfgs, n_envs=1, act_dim=7)
+    ts.set_trajectory(dense, gripper=_t.zeros(60))
+    ts.reset(state=_t.tensor([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]]))
+    far = _t.tensor([[0.30, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]])   # 30 cm away
+    _, w_far, d_far = ts.action(far)
+    assert float(w_far[0]) > 0.0, "soft gate collapsed to 0 => KL would be a no-op"
+    ts.reset(state=_t.tensor([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]]))
+    _, w_near, _ = ts.action(_t.tensor([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]]))
+    assert float(w_near[0]) > 0.99, float(w_near[0])
+    # NB: d_far is < 0.30 because the window clamps the match to j+window; that is
+    # the point of the rate limit, so the assertion is relative, not absolute.
+    assert float(w_far[0]) < float(w_near[0]) * 1e-4, (float(w_far[0]), float(w_near[0]))
+    print(f"soft gate: w(on-path)={float(w_near[0]):.4f}  w(far, d={float(d_far[0]):.3f}m)="
+          f"{float(w_far[0]):.2e}  -- never exactly 0, so Eq.(7) always has a gradient")
+
+    # ---- (4) gripper decoupling ----
+    g = _t.zeros(60)
+    g[30:] = -1.0                                     # closes at waypoint 30
+    cgn = AlignConfig(align="window", gate="hard", eps=1e9, gripper_src="none")
+    tg = TrajectoryTeacher(cgn, n_envs=1, act_dim=7)
+    tg.set_trajectory(dense, gripper=g)
+    tg.reset(state=_t.tensor([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]]))
+    ag, _, _ = tg.action(_t.tensor([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]]))
+    assert float(ag[0, -1]) == 0.0, float(ag[0, -1])
+    print("gripper_src='none' emits exactly 0 on the gripper dim")
+
+    # ---- (5) window mode: a BACKWARD excursion must not rewind j ----
+    cw2 = AlignConfig(align="window", window=5, lookahead=1, lookahead_dist=0.0,
+                      gate="hard", eps=1e9)
+    tw2 = TrajectoryTeacher(cw2, n_envs=1, act_dim=7)
+    tw2.set_trajectory(dense, gripper=_t.zeros(60))
+    tw2.reset(state=_t.tensor([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]]))
+    for x in (0.0, 0.02, 0.04, 0.06):
+        pass
+    # walk forward, then jump backwards to the origin
+    for x in (0.0, 0.01, 0.02, 0.03, 0.04):
+        tw2.action(_t.tensor([[x, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]]))
+    j_before = int(tw2.j[0])
+    tw2.action(_t.tensor([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]]))
+    assert int(tw2.j[0]) >= j_before, (j_before, int(tw2.j[0]))
+    print(f"backward excursion: j {j_before} -> {int(tw2.j[0])} (no phase collapse)")
+
+    # ---- (6) reset re-anchoring ----
+    cr = AlignConfig(align="window", reanchor_on_reset=True)
+    tr = TrajectoryTeacher(cr, n_envs=1, act_dim=7)
+    tr.set_trajectory(dense)
+    tr.reset(state=_t.tensor([[0.30, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]]))
+    assert int(tr.j[0]) == 50, int(tr.j[0])           # 0.30 / 0.006 = 50
+    print(f"reanchor_on_reset: j={int(tr.j[0])} (nearest to a 0.30 m start)")
+
+    print("\n*** ALL alignment regression tests PASSED ***")

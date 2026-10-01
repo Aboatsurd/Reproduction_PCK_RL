@@ -45,3 +45,7 @@ _assets/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# --- 本地源文件备份（改动前的快照，故意不入库；原始版本在 git 历史里）---
+_repro/**/_backup_*/
+_repro/**/*.bak
