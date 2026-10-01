@@ -116,13 +116,16 @@ vulkaninfo --summary
 服务器上**没有**这个仓库。二选一：
 
 ```bash
-# 方式 A：你已推到 GitHub（推荐）
-cd /root && git clone https://github.com/Aboatsurd/PCK-RL.git && cd PCK-RL
+# 方式 A：git clone（推荐；仓库已推上 GitHub 且是 public，无需任何凭证）
+cd /root && git clone https://github.com/Aboatsurd/Reproduction_PCK_RL.git && cd Reproduction_PCK_RL
 
 # 方式 B：本机打包上传（本机 PowerShell 执行）
 #   tar -czf pckrl-src.tgz --exclude=_repro/venv --exclude=.git --exclude=__pycache__ -C E:\Users\bobxu\PycharmProjects PCK-RL
 #   然后用 CompShare 控制台的「文件上传」/JupyterLab 传上去
 ```
+
+> 远程：`origin` = `https://github.com/Aboatsurd/Reproduction_PCK_RL.git`（**public**，clone 免登录），
+> `upstream` = `https://github.com/lqxsds/PCK-RL`（论文作者原仓库，只读）。
 
 > 全仓 tracked 只有 **203.8 MB**（`mani_skill/assets/robots` 145 MB + `environment_maps` 32 MB 是大头，任务加载要用，别删）。`.git` 另有 86 MB。
 > 若嫌大：`git clone --depth 1` 可省掉 86 MB 历史。
