@@ -1,0 +1,47 @@
+# ---------------------------------------------------------------------------
+# PCK-RL reproduction fork -- ignore rules
+#
+# The repo is a ManiSkill3 fork (v3.0.0b14) plus our own reproduction work.
+# Rule of thumb: commit SOURCE + SCRIPTS + LOGS (small, they are evidence),
+# never commit anything machine-specific or regenerable.
+# ---------------------------------------------------------------------------
+
+# --- Python bytecode / packaging ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- virtualenvs: platform-specific, MUST be rebuilt on the target machine ---
+_repro/venv/
+.venv/
+venv/
+env/
+
+# --- training outputs ---
+runs/
+wandb/
+outputs/
+*.ckpt
+*.pt
+*.pth
+
+# --- SAPIEN / ManiSkill asset cache (re-downloaded via MS_ASSET_DIR) ---
+_assets/
+.maniskill/
+
+# --- IDE / editor ---
+.idea/
+.vscode/
+*.swp
+
+# --- OS ---
+Thumbs.db
+Desktop.ini
+.DS_Store

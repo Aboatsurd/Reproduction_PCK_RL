@@ -1,0 +1,35 @@
+# ---------------------------------------------------------------------------
+# Line-ending policy -- this repo is authored on Windows and RUN on Linux.
+#
+# Without this file git rewrites LF -> CRLF in the Windows working copy, which
+# travels to Linux and breaks shell scripts with:
+#     bash: ./foo.sh: /bin/bash^M: bad interpreter: No such file or directory
+# It also makes every Python file diff as "whole file changed" on the Linux side.
+#
+# Rule: LF everywhere, except Windows-only script types.
+# ---------------------------------------------------------------------------
+
+* text=auto eol=lf
+
+# Windows-only script types keep CRLF (cmd.exe / PowerShell 5.1 expect it)
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# Shell scripts and Python MUST be LF -- they run on Linux
+*.sh   text eol=lf
+*.py   text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+
+# Binary -- never touch
+*.obj   binary
+*.ply   binary
+*.png   binary
+*.jpg   binary
+*.npy   binary
+*.npz   binary
+*.pt    binary
+*.stl   binary
+*.urdf  text eol=lf
+*.xml   text eol=lf
